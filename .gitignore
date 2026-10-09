@@ -1,0 +1,76 @@
+# ── Secrets & Environment ────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Python ───────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+
+# ── Virtual Environments ─────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.virtualenv/
+
+# ── Distribution / Packaging ─────────────────────────────────────────
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+MANIFEST
+
+# ── Testing ──────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+*.cover
+coverage.xml
+
+# ── Type Checking ────────────────────────────────────────────────────
+.mypy_cache/
+.dmypy.json
+.pyright/
+
+# ── Logs & Runtime ───────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Intel / Data Output (honeypot artifacts) ─────────────────────────
+intel/*.json
+intel/*.csv
+intel/*.jsonl
+sessions/
+session_logs/
+data/intel_logs/
+data/
+reports/
+
+# ── LangGraph / LangChain ────────────────────────────────────────────
+.langgraph_cache/
+
+# ── Streamlit ────────────────────────────────────────────────────────
+.streamlit/secrets.toml
+
+# ── OS & Editor ──────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── Temporary Files ──────────────────────────────────────────────────
+tmp/
+temp/
+*.tmp
+*.bak

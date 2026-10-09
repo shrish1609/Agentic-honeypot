@@ -1,0 +1,18 @@
+# Core agent — LangGraph + LLM clients
+langgraph>=0.2.0
+langchain-core>=0.2.0
+google-genai>=0.8.0
+requests>=2.32.0
+python-dotenv>=1.0.0
+pydantic>=2.7.0
+
+# API
+fastapi>=0.111.0
+uvicorn>=0.30.0
+
+# MongoDB (optional — only used if USE_DB=true in .env)
+motor>=3.4.0
+pymongo>=4.7.0
+
+# Testing
+pytest>=8.0.0

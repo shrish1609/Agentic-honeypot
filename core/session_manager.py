@@ -169,6 +169,7 @@ class HoneypotSession:
             "report_path":        result.get("report_path", ""),
             "report_sent":        result.get("report_sent", False),
             "email_recipient_count": result.get("email_recipient_count", 0),
+            "report_status":      result.get("report_status", "awaiting_evidence"),
             "report_error":       result.get("report_error", ""),
             "last_reported_fp":   result.get("last_reported_fp", ""),
         }

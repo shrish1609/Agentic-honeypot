@@ -61,6 +61,56 @@ def _to_dict(state) -> dict:
 
 
 
+def _rule_based_intake(message: str) -> dict | None:
+    normalized = " ".join(message.casefold().split())
+    negative_warning = re.search(
+        r"\b(?:do not|don't|never|avoid)\s+(?:share|send|give|provide|enter)\b",
+        normalized,
+    )
+    if negative_warning:
+        return None
+
+    asks_for_secrets = bool(
+        re.search(r"\b(?:otp|one[- ]time password|pin|cvv|password|atm card number|account number|card number)\b", normalized)
+        and re.search(r"\b(?:share|send|give|provide|enter|tell|reply)\b", normalized)
+    )
+    has_upi = bool(
+        re.search(r"\b(?:upi|vpa|google pay|gpay|phonepe|paytm|qr code)\b", normalized)
+        or _UPI_RE.search(message)
+    )
+    payment_action = bool(re.search(r"\b(?:pay|send|transfer|deposit|payment|scan)\b", normalized))
+    bank_context = bool(
+        re.search(r"\b(?:bank|sbi|hdfc|icici|axis|kotak|pnb|rbi|kyc|loan)\b", normalized)
+    )
+    deceptive_bank_claim = bool(
+        bank_context
+        and re.search(r"\b(?:kyc|verify|blocked|suspend|expired|loan|update)\b", normalized)
+        and ("link" in normalized or "http://" in normalized or "https://" in normalized or asks_for_secrets)
+    )
+
+    if has_upi and payment_action:
+        scam_type = "upi_fraud"
+        threat_level = "high"
+        indicators = ["UPI/payment transfer request"]
+    elif asks_for_secrets:
+        scam_type = "phishing"
+        threat_level = "high"
+        indicators = ["Request for sensitive credentials or financial details"]
+    elif deceptive_bank_claim:
+        scam_type = "phishing"
+        threat_level = "medium"
+        indicators = ["Bank/KYC claim directing the recipient to a link"]
+    else:
+        return None
+
+    return {
+        "scam_type": scam_type,
+        "threat_level": threat_level,
+        "confidence_score": 0.92,
+        "scam_indicators": indicators,
+    }
+
+
 def intake_node(state: dict) -> dict:
     """
     NODE 1: Classify the scammer's message.
@@ -73,7 +123,11 @@ def intake_node(state: dict) -> dict:
         logger.warning("intake_node: empty scammer message received")
         return {}
 
-    data, model = llm.chat_json(_INTAKE_SYSTEM, message)
+    data = _rule_based_intake(message)
+    if data is None:
+        data, model = llm.chat_json(_INTAKE_SYSTEM, message)
+    else:
+        model = "rule-based"
 
     # Validate and sanitise LLM output with safe fallbacks
     valid_scam_types = {"upi_fraud","phishing","fake_lottery","job_scam","romance_scam","tech_support","unknown"}

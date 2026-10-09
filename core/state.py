@@ -112,6 +112,7 @@ class HoneypotState(BaseModel):
     report_path: str = ""
     report_sent: bool = False
     email_recipient_count: int = 0
+    report_status: str = "awaiting_evidence"
     report_error: str = ""
     last_reported_fp: str = ""
 

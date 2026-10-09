@@ -7,6 +7,7 @@ breaking the chat loop.
 """
 
 import hashlib
+import html
 import json
 import os
 import re
@@ -99,11 +100,36 @@ def _dedupe_emails(values: list[str] | tuple[str, ...] | str | None) -> list[str
     return final
 
 
+def _is_placeholder_email(value: str) -> bool:
+    if not _valid_email(value):
+        return True
+    domain = value.rsplit("@", 1)[1].strip().casefold()
+    return domain in {"example.com", "example.org", "example.net", "example.invalid"} or domain.endswith(".example")
+
+
 def _complainant_is_complete(report: dict) -> bool:
     complainant = report.get("complainant") or {}
     if not isinstance(complainant, dict):
         return False
-    return all(str(complainant.get(field, "")).strip() for field in ("name", "phone", "email"))
+    values = {field: str(complainant.get(field, "")).strip() for field in ("name", "phone", "email")}
+    return all(values.values()) and all(
+        not _is_placeholder_complainant_value(field, value)
+        for field, value in values.items()
+    ) and _valid_email(values["email"]) and not _is_placeholder_email(values["email"])
+
+
+def _is_placeholder_complainant_value(field: str, value: str) -> bool:
+    normalized = value.strip().casefold()
+    if field == "name":
+        return normalized in {"jane doe", "john doe", "your name", "full name"}
+    if field == "email":
+        return normalized in {"jane.doe@example.com", "you@example.com", "your.email@example.com"}
+    if field == "phone":
+        digits = re.sub(r"\D", "", value)
+        if digits.startswith("91") and len(digits) == 12:
+            digits = digits[2:]
+        return digits in {"9876543210", "1234567890", "0000000000"}
+    return False
 
 
 def _is_test_mode() -> bool:
@@ -155,6 +181,8 @@ def _resolved_recipients(report: dict) -> list[str]:
     report_recipients = _dedupe_emails(report.get("email_recipients") or [])
     recipients = env_recipients if env_recipients else report_recipients
     copy_self = _dedupe_emails(os.getenv("REPORT_COPY_TO_SELF", ""))
+    recipients = [email for email in recipients if not _is_placeholder_email(email)]
+    copy_self = [email for email in copy_self if not _is_placeholder_email(email)]
 
     if _is_test_mode():
         return copy_self
@@ -202,19 +230,36 @@ def _transcript_from_state(state: dict) -> list[dict]:
     return transcript
 
 
-def should_report(intel: dict, scam_score: float) -> bool:
+def should_report(intel: dict, scam_score: float, threat_level: str = "low") -> bool:
     """Return True only when there is actionable scammer intel above the threshold."""
+    return not _report_gate_status(intel, scam_score, threat_level=threat_level)
+
+
+def _report_gate_status(
+    intel: dict,
+    scam_score: float,
+    scam_type: str = "unknown",
+    threat_level: str = "low",
+) -> str:
+    """Explain why a local report draft is not eligible."""
+    if str(threat_level).strip().casefold() not in {"high", "critical"}:
+        return "below_threat_threshold"
+
+    intel_dict = _as_intel_dict(intel)
+    has_actionable_intel = any(bool(intel_dict.get(key, [])) for key in _IDENTIFIER_KEYS)
+    is_classified_scam = bool(scam_type and scam_type != "unknown")
+
     try:
         score = float(scam_score)
     except (TypeError, ValueError):
-        return False
+        return "awaiting_confidence"
 
     threshold = float(os.getenv("REPORT_MIN_SCORE", "0.8"))
-    if score < threshold:
-        return False
-
-    intel_dict = _as_intel_dict(intel)
-    return any(bool(intel_dict.get(key, [])) for key in _IDENTIFIER_KEYS)
+    if score >= threshold and (has_actionable_intel or is_classified_scam):
+        return ""
+    if has_actionable_intel or is_classified_scam:
+        return "awaiting_confidence"
+    return "awaiting_evidence"
 
 
 def _complainant_from_env() -> dict[str, str]:
@@ -225,12 +270,21 @@ def _complainant_from_env() -> dict[str, str]:
         ("COMPLAINANT_EMAIL", "email"),
     ):
         value = (os.getenv(env_var, "") or "").strip()
-        if value:
+        if value and not _is_placeholder_complainant_value(field_name, value):
             complainant[field_name] = value
     return complainant
 
 
-def build_report(session_id: str, intel: dict, transcript: list[dict] | list[str] | None) -> dict:
+def build_report(
+    session_id: str,
+    intel: dict,
+    transcript: list[dict] | list[str] | None,
+    *,
+    scam_type: str | None = None,
+    threat_level: str | None = None,
+    confidence_score: float | None = None,
+    scam_indicators: list[str] | None = None,
+) -> dict:
     intel_dict = _as_intel_dict(intel)
     cleaned_transcript = []
     raw_identifiers = []
@@ -257,17 +311,22 @@ def build_report(session_id: str, intel: dict, transcript: list[dict] | list[str
         "report_fingerprint": _fingerprint(intel_dict),
         "email_recipients": _parse_recipients(os.getenv("REPORT_RECIPIENTS", "")),
         "complainant": _complainant_from_env(),
-        "scam_type": os.getenv("LAST_SCAM_TYPE", "unknown"),
+        "scam_type": scam_type or os.getenv("LAST_SCAM_TYPE", "unknown"),
+        "threat_level": threat_level or "unknown",
+        "confidence_score": confidence_score,
+        "scam_indicators": _safe_list(scam_indicators),
     }
     return report
 
 
 def report_to_text(report: dict) -> str:
+    scam_type = str(report.get("scam_type", "unknown")).replace("_", " ")
+    classification = "UPI Fraud" if scam_type.casefold() == "upi fraud" else scam_type.title()
     lines = [
-        "Scam evidence report",
-        "====================",
-        f"Session ID: {report.get('session_id', 'unknown')}",
-        f"Generated at: {report.get('generated_at', _now())}",
+        "DIGITAL FRAUD INCIDENT REPORT",
+        "=" * 31,
+        f"Case reference: {report.get('session_id', 'unknown')}",
+        f"Generated (UTC): {report.get('generated_at', _now())}",
         "",
     ]
 
@@ -283,25 +342,157 @@ def report_to_text(report: dict) -> str:
             lines.append(f"Complainant: {' | '.join(parts)}")
             lines.append("")
 
-    lines.append("Identifiers found:")
+    lines.extend([
+        "INCIDENT ASSESSMENT",
+        "-------------------",
+        f"Classification: {classification}",
+        f"Threat level: {str(report.get('threat_level', 'unknown')).title()}",
+    ])
+    confidence = report.get("confidence_score")
+    if confidence is not None:
+        lines.append(f"Assessment confidence: {float(confidence):.0%}")
+
+    indicators = _safe_list(report.get("scam_indicators", []))
+    if indicators:
+        lines.append("Observed indicators:")
+        lines.extend(f"- {indicator}" for indicator in indicators)
+
+    lines.extend(["", "EVIDENCE REGISTER", "-----------------"])
 
     intel = report.get("intel", {})
     found_any = False
-    for key in _IDENTIFIER_KEYS:
+    evidence_labels = (
+        ("upi_ids", "UPI identifiers"),
+        ("phone_numbers", "Phone numbers"),
+        ("account_numbers", "Account numbers"),
+        ("ifsc_codes", "IFSC codes"),
+        ("urls", "URLs"),
+        ("bank_names", "Bank references"),
+        ("names", "Names mentioned"),
+    )
+    for key, label in evidence_labels:
         values = intel.get(key, [])
         if values:
             found_any = True
-            lines.append(f"- {key}: {', '.join(values)}")
+            lines.append(f"{label}: {', '.join(values)}")
     if not found_any:
-        lines.append("- None")
+        lines.append("No identifiers were captured.")
 
-    lines.extend(["", "Transcript:"])
+    lines.extend(["", "CONVERSATION RECORD", "-------------------"])
     for entry in report.get("transcript", []):
-        role = entry.get("role", "bot")
+        role = str(entry.get("role", "bot")).title()
         content = entry.get("content", "")
         lines.append(f"[{role}] {content}")
 
+    lines.extend([
+        "",
+        "REVIEW NOTICE",
+        "-------------",
+        "This report is AI-assisted and contains unverified allegations and extracted data.",
+        "A human reviewer must validate the evidence and recipient before any external filing.",
+    ])
     return "\n".join(lines) + "\n"
+
+
+def report_to_html(report: dict) -> str:
+        """Render an email-safe, self-contained HTML incident report."""
+        escape = html.escape
+        scam_type = str(report.get("scam_type", "unknown")).replace("_", " ")
+        classification = "UPI Fraud" if scam_type.casefold() == "upi fraud" else scam_type.title()
+        threat = str(report.get("threat_level", "unknown")).title()
+        confidence = report.get("confidence_score")
+        confidence_text = f"{float(confidence):.0%}" if confidence is not None else "Not assessed"
+
+        summary_rows = [
+                ("Case reference", report.get("session_id", "unknown")),
+                ("Classification", classification),
+                ("Threat level", threat),
+                ("Assessment confidence", confidence_text),
+                ("Generated (UTC)", report.get("generated_at", _now())),
+        ]
+        summary_html = "".join(
+                f"<tr><th>{escape(str(label))}</th><td>{escape(str(value))}</td></tr>"
+                for label, value in summary_rows
+        )
+
+        complainant = report.get("complainant") or {}
+        complainant_html = ""
+        if _complainant_is_complete(report):
+                complainant_html = (
+                        "<section><h2>Complainant</h2><p>"
+                        f"{escape(str(complainant['name']))} · "
+                        f"{escape(str(complainant['phone']))} · "
+                        f"{escape(str(complainant['email']))}</p></section>"
+                )
+
+        indicators = _safe_list(report.get("scam_indicators", []))
+        indicators_html = "".join(f"<li>{escape(item)}</li>" for item in indicators)
+        if not indicators_html:
+                indicators_html = "<li>No indicators recorded.</li>"
+
+        intel = report.get("intel", {})
+        evidence_rows = []
+        for key, label in (
+                ("upi_ids", "UPI identifiers"),
+                ("phone_numbers", "Phone numbers"),
+                ("account_numbers", "Account numbers"),
+                ("ifsc_codes", "IFSC codes"),
+                ("urls", "URLs"),
+                ("bank_names", "Bank references"),
+                ("names", "Names mentioned"),
+        ):
+                values = _safe_list(intel.get(key, []))
+                if values:
+                        evidence_rows.append(
+                                f"<tr><th>{escape(label)}</th><td>{'<br>'.join(escape(item) for item in values)}</td></tr>"
+                        )
+        evidence_html = "".join(evidence_rows) or "<tr><td colspan=\"2\">No identifiers captured yet.</td></tr>"
+
+        transcript_rows = []
+        for entry in report.get("transcript", []):
+                role = escape(str(entry.get("role", "unknown")).title())
+                content = escape(str(entry.get("content", "")))
+                transcript_rows.append(
+                        f"<tr><th>{role}</th><td>{content}</td></tr>"
+                )
+        transcript_html = "".join(transcript_rows) or "<tr><td colspan=\"2\">No conversation record available.</td></tr>"
+
+        return f"""<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Digital Fraud Incident Report</title></head>
+<body style="margin:0;background:#f2f5f7;color:#17212b;font-family:Arial,Helvetica,sans-serif;">
+<main style="max-width:760px;margin:24px auto;background:#ffffff;border:1px solid #d9e1e7;">
+    <header style="padding:28px 32px;background:#123b35;color:#ffffff;border-bottom:4px solid #24a47a;">
+        <div style="font-size:11px;letter-spacing:1.4px;text-transform:uppercase;color:#bfe8d9;">Incident dossier</div>
+        <h1 style="margin:8px 0 0;font-size:25px;line-height:1.25;">Digital Fraud Incident Report</h1>
+        <p style="margin:8px 0 0;color:#dbece6;font-size:14px;">Case {escape(str(report.get('session_id', 'unknown')))}</p>
+    </header>
+    <div style="padding:24px 32px 30px;">
+        {complainant_html}
+        <section><h2 style="margin:0 0 12px;font-size:17px;">Incident assessment</h2>
+            <table role="presentation" style="width:100%;border-collapse:collapse;font-size:14px;">{summary_html}</table>
+        </section>
+        <section style="margin-top:24px;"><h2 style="margin:0 0 12px;font-size:17px;">Observed indicators</h2>
+            <ul style="margin:0;padding-left:20px;font-size:14px;line-height:1.6;">{indicators_html}</ul>
+        </section>
+        <section style="margin-top:24px;"><h2 style="margin:0 0 12px;font-size:17px;">Evidence register</h2>
+            <table role="presentation" style="width:100%;border-collapse:collapse;font-size:14px;">{evidence_html}</table>
+        </section>
+        <section style="margin-top:24px;"><h2 style="margin:0 0 12px;font-size:17px;">Conversation record</h2>
+            <table role="presentation" style="width:100%;border-collapse:collapse;font-size:13px;">{transcript_html}</table>
+        </section>
+        <aside style="margin-top:26px;padding:14px 16px;background:#f4f7f8;border-left:3px solid #758795;font-size:12px;line-height:1.55;color:#43515d;">
+            <strong>Review required.</strong> This report is AI-assisted. Allegations and extracted data are unverified; a human reviewer must validate the evidence and recipient before external filing.
+        </aside>
+    </div>
+</main>
+<style>
+table th,table td{{padding:9px 10px;border-bottom:1px solid #e3e9ed;text-align:left;vertical-align:top;}}
+table th{{width:34%;color:#536471;font-weight:600;}}
+h2{{color:#123b35;}}
+</style>
+</body></html>"""
 
 
 def save_report(report: dict) -> Path:
@@ -309,17 +500,21 @@ def save_report(report: dict) -> Path:
     session_id = report.get("session_id", "unknown")
     json_path = _REPORTS_DIR / f"report_{session_id}.json"
     txt_path = _REPORTS_DIR / f"report_{session_id}.txt"
+    html_path = _REPORTS_DIR / f"report_{session_id}.html"
 
     with json_path.open("w", encoding="utf-8") as handle:
         json.dump(report, handle, indent=2, ensure_ascii=False)
 
     txt_path.write_text(report_to_text(report), encoding="utf-8")
-    return txt_path
+    html_path.write_text(report_to_html(report), encoding="utf-8")
+    return html_path
 
 
 def send_email(report: dict) -> bool:
     """Send a report by SMTP with STARTTLS and evidence attachments."""
-    if not _complainant_is_complete(report):
+    if str(report.get("threat_level", "low")).strip().casefold() not in {"high", "critical"}:
+        return False
+    if not _is_test_mode() and not _complainant_is_complete(report):
         return False
     if _rate_limit_reached():
         return False
@@ -348,6 +543,7 @@ def send_email(report: dict) -> bool:
     msg["From"] = smtp_user
     msg["To"] = ", ".join(recipients)
     msg.set_content(report_to_text(report))
+    msg.add_alternative(report_to_html(report), subtype="html")
 
     evidence_payload = json.dumps(report, indent=2, ensure_ascii=False).encode("utf-8")
     msg.add_attachment(
@@ -357,15 +553,10 @@ def send_email(report: dict) -> bool:
         filename=f"evidence_{session_id}.json",
     )
 
-    txt_payload = report_to_text(report).encode("utf-8")
-    msg.add_attachment(
-        txt_payload,
-        maintype="text",
-        subtype="plain",
-        filename=f"report_{session_id}.txt",
-    )
+    html_payload = report_to_html(report).encode("utf-8")
+    msg.add_attachment(html_payload, maintype="text", subtype="html", filename=f"report_{session_id}.html")
 
-    smtp = smtplib.SMTP(smtp_host, smtp_port)
+    smtp = smtplib.SMTP(smtp_host, smtp_port, timeout=30)
     try:
         smtp.starttls()
         smtp.login(smtp_user, smtp_pass)
@@ -382,47 +573,69 @@ def send_email(report: dict) -> bool:
 def reporter_node(state: dict) -> dict:
     """LangGraph node that saves any reportable intel without breaking the chat loop."""
     state = _to_dict(state)
-    state["report_path"] = state.get("report_path", "")
+    state["report_path"] = ""
     state["report_sent"] = False
+    state["report_status"] = _report_gate_status(
+        state.get("intel", {}) or {},
+        state.get("confidence_score", 0.0),
+        state.get("scam_type", "unknown"),
+        state.get("threat_level", "low"),
+    )
     state["report_error"] = ""
 
     intel = state.get("intel", {}) or {}
-    if not should_report(intel, state.get("confidence_score", 0.0)):
+    if state["report_status"]:
         return state
 
     try:
         session_id = state.get("session_id", "unknown")
         transcript = _transcript_from_state(state)
-        report = build_report(session_id, intel, transcript)
-        report["scam_type"] = state.get("scam_type", report.get("scam_type", "unknown"))
+        report = build_report(
+            session_id,
+            intel,
+            transcript,
+            scam_type=state.get("scam_type", "unknown"),
+            threat_level=state.get("threat_level", "unknown"),
+            confidence_score=state.get("confidence_score"),
+            scam_indicators=state.get("scam_indicators", []),
+        )
         fp = report.get("report_fingerprint", "")
         previous_fp = str(state.get("last_reported_fp", ""))
         report_path = save_report(report)
         state["report_path"] = str(report_path)
         state["last_reported_fp"] = fp
         state["email_recipient_count"] = 0
+        has_actionable_intel = any(bool(_as_intel_dict(intel).get(key, [])) for key in _IDENTIFIER_KEYS)
 
+        if not has_actionable_intel:
+            state["report_status"] = "draft_saved_waiting_evidence"
+            return state
+
+        state["report_status"] = "draft_saved"
         if previous_fp and previous_fp == fp:
-            state["report_sent"] = False
+            state["report_status"] = "already_reported"
             return state
 
         auto_report = os.getenv("AUTO_REPORT", "draft").strip().lower()
         if auto_report != "send":
             return state
 
-        if not _complainant_is_complete(report):
+        if not _is_test_mode() and not _complainant_is_complete(report):
             state["report_error"] = "Complainant details missing"
+            state["report_status"] = "email_not_configured"
             return state
 
         if _rate_limit_reached():
             state["report_error"] = "Rate limit reached"
             state["report_sent"] = False
+            state["report_status"] = "rate_limited"
             return state
 
         recipients = _resolved_recipients(report)
         if not recipients:
             state["report_error"] = "No valid recipients"
             state["report_sent"] = False
+            state["report_status"] = "email_not_configured"
             return state
 
         state["email_recipient_count"] = len(recipients)
@@ -430,17 +643,22 @@ def reporter_node(state: dict) -> dict:
         try:
             state["report_sent"] = bool(send_email(report))
             if not state["report_sent"]:
+                state["report_status"] = "email_failed"
                 if not _resolved_recipients(report):
                     state["report_error"] = "No valid recipients"
                 elif _rate_limit_reached():
                     state["report_error"] = "Rate limit reached"
                 else:
                     state["report_error"] = "Email sending failed or no recipients were configured."
+            else:
+                state["report_status"] = "sent"
         except Exception as exc:  # pragma: no cover - defensive branch
             state["report_error"] = str(exc)
             state["report_sent"] = False
+            state["report_status"] = "email_failed"
     except Exception as exc:  # pragma: no cover - defensive branch
         state["report_error"] = str(exc)
         state["report_sent"] = False
+        state["report_status"] = "report_failed"
 
     return state

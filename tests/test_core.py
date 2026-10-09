@@ -40,6 +40,7 @@ class TestState:
         assert s.scam_type == "unknown"
         assert s.threat_level == "low"
         assert s.intel_yield_score == 0.0
+        assert s.report_status == "awaiting_evidence"
         assert s.email_recipient_count == 0
 
     def test_extracted_intel_defaults(self):
@@ -331,6 +332,46 @@ class TestNodes:
             result = intake_node({"current_scammer_message": "test"})
             assert result["scam_type"] == "unknown"
 
+    def test_intake_classifies_bank_credential_request_deterministically(self):
+        from core.nodes import intake_node
+
+        with patch("core.nodes.llm") as mock_llm:
+            result = intake_node({
+                "current_scammer_message": "SBI agent: share your bank account number and ATM card PIN now"
+            })
+
+        assert result["scam_type"] == "phishing"
+        assert result["threat_level"] == "high"
+        assert result["confidence_score"] == 0.92
+        mock_llm.chat_json.assert_not_called()
+
+    def test_intake_classifies_direct_upi_payment_deterministically(self):
+        from core.nodes import intake_node
+
+        with patch("core.nodes.llm") as mock_llm:
+            result = intake_node({
+                "current_scammer_message": "Pay 500 rupees to scammer123@upi now"
+            })
+
+        assert result["scam_type"] == "upi_fraud"
+        assert result["threat_level"] == "high"
+        mock_llm.chat_json.assert_not_called()
+
+    def test_intake_does_not_rule_classify_safety_warning(self):
+        from core.nodes import intake_node
+
+        with patch("core.nodes.llm") as mock_llm:
+            mock_llm.chat_json.return_value = (
+                {"scam_type": "unknown", "threat_level": "low", "confidence_score": 0.2},
+                "test-model",
+            )
+            result = intake_node({
+                "current_scammer_message": "Never share your OTP or PIN with anyone"
+            })
+
+        assert result["scam_type"] == "unknown"
+        mock_llm.chat_json.assert_called_once()
+
     def test_intake_handles_invalid_threat_level(self):
         from core.nodes import intake_node
         with patch("core.nodes.llm") as mock_llm:
@@ -388,6 +429,91 @@ class TestNodes:
         _print_report_status({"report_path": "", "report_sent": False})
 
         assert "No report generated" in capsys.readouterr().out
+
+    def test_demo_reply_addresses_the_submitted_link(self):
+        from app.dashboard import _demo_turn
+
+        result = _demo_turn("http://localhost:8501", "KYC / bank scam", "Hinglish")
+
+        assert "link" in result["reply"].lower()
+        assert result["intel"]["URL"] == ["http://localhost:8501"]
+        assert result["intel"]["UPI"] == []
+        assert result["intel"]["Phone"] == []
+        assert result["intel"]["Bank"] == []
+
+    def test_demo_reply_addresses_a_credential_request(self):
+        from app.dashboard import _demo_turn
+
+        result = _demo_turn(
+            "Share your ATM card PIN now", "KYC / bank scam", "Hinglish"
+        )
+
+        assert "PIN" in result["reply"]
+        assert result["scam_type"] == "phishing"
+        assert result["threat_level"] == "high"
+
+    def test_demo_replies_change_for_repeated_turns(self):
+        from app.dashboard import _demo_turn
+
+        first = _demo_turn("Hello", "KYC / bank scam", "Hinglish")
+        second = _demo_turn(
+            "Hello", "KYC / bank scam", "Hinglish", [first["reply"]]
+        )
+
+        assert first["reply"] != second["reply"]
+
+    def test_demo_auto_detection_does_not_assume_default_kyc_scam(self):
+        from app.dashboard import _demo_turn
+
+        result = _demo_turn("hello", "KYC / bank scam", "Hinglish")
+
+        assert result["scenario"] == "General / unknown"
+        assert result["scam_type"] == "unknown"
+
+    def test_demo_auto_detects_upi_scenario(self):
+        from app.dashboard import _demo_turn
+
+        result = _demo_turn("Pay 500 to my UPI ID test@upi", "KYC / bank scam", "Hinglish")
+
+        assert result["scenario"] == "UPI payment scam"
+        assert result["scam_type"] == "upi_fraud"
+
+    def test_demo_manual_scenario_override_is_respected(self):
+        from app.dashboard import _demo_turn
+
+        result = _demo_turn(
+            "Pay 500 through UPI", "Job offer scam", "Hinglish", auto_detect=False
+        )
+
+        assert result["scenario"] == "Job offer scam"
+        assert result["scam_type"] == "job_scam"
+
+    def test_dashboard_email_failure_message_hides_mail_configuration(self):
+        from app.dashboard import _report_status_message
+
+        kind, message = _report_status_message("email_failed")
+
+        assert kind == "warning"
+        assert "delivery failed" in message
+        assert "SMTP" not in message
+        assert "recipient" not in message.lower()
+
+    def test_dashboard_explains_draft_waiting_for_evidence(self):
+        from app.dashboard import _report_status_message
+
+        kind, message = _report_status_message("draft_saved_waiting_evidence")
+
+        assert kind == "info"
+        assert "draft" in message.lower()
+        assert "email is held" in message.lower()
+
+    def test_dashboard_explains_threat_threshold(self):
+        from app.dashboard import _report_status_message
+
+        kind, message = _report_status_message("below_threat_threshold")
+
+        assert kind == "info"
+        assert "high or critical" in message.lower()
 
     def test_cli_prints_email_recipient_count(self, capsys):
         from core.run_cli import _print_report_status
@@ -654,6 +780,7 @@ class TestSessionManager:
                 "intel_yield_score": 0.3, "intel": {}, "model_used": "test-model",
                 "report_path": "reports/report_TEST.txt", "report_sent": True,
                 "email_recipient_count": 2,
+                "report_status": "sent",
             }
             with patch("core.session_manager.honeypot_graph.invoke", return_value=graph_result), \
                  patch.object(session, "_persist", new_callable=AsyncMock):
@@ -661,3 +788,4 @@ class TestSessionManager:
 
         result = asyncio.run(run())
         assert result["email_recipient_count"] == 2
+        assert result["report_status"] == "sent"

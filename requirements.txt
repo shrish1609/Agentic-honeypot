@@ -10,6 +10,9 @@ pydantic>=2.7.0
 fastapi>=0.111.0
 uvicorn>=0.30.0
 
+# Dashboard
+streamlit>=1.30.0
+
 # MongoDB (optional — only used if USE_DB=true in .env)
 motor>=3.4.0
 pymongo>=4.7.0
